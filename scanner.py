@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # ==============================================================================
 API_KEY = os.environ.get("MASSIVE_API_KEY")
 TARGET_GAIN = 0.50             # 50% minimum close-to-close gain to qualify
-MIN_LIQUIDITY_VOLUME = 100000 # Filter out zero-volume "sub-penny zombie" spikes
+MIN_LIQUIDITY_VOLUME = 100000  # Filter out zero-volume "sub-penny zombie" spikes
 MIN_PRICE_FLOOR = 1.00         # Filter out sub-dollar junk to control locate fees
 CACHE_FILE = os.path.expanduser("~/tracker/history.json")
 WEB_DIR = os.path.expanduser("~/tracker/www")
@@ -31,17 +31,14 @@ def is_common_stock_symbol(ticker):
     return True
 
 def get_market_days_needed(count=6):
-    """
-    Returns the last N market days. Since this runs past midnight (1:00 AM EST),
-    the calculation loop anchors backward starting from yesterday.
-    """
+    """Returns the last N market days, anchored backward from yesterday."""
     days = []
     check_date = datetime.now() - timedelta(days=1) 
     while len(days) < count:
         if check_date.weekday() < 5:  # Monday - Friday
             days.append(check_date.strftime("%Y-%m-%d"))
         check_date -= timedelta(days=1)
-    days.reverse()  # Chronological order: [Oldest -> Newest (Yesterday)]
+    days.reverse()  
     return days
 
 def get_bulk_data(date_str):
@@ -68,8 +65,8 @@ def get_ticker_details(ticker):
 
 def get_high_of_day_metrics(ticker, date_str):
     """
-    Parses 1-minute historical aggregate bars to isolate the absolute high,
-    absolute low, peak time window, and maximum localized execution volume.
+    Parses 1-minute historical aggregate bars (4:00 AM to 8:00 PM EST) to isolate
+    absolute high/low execution marks and calculates the time duration from the open.
     """
     url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{date_str}/{date_str}?adjusted=true&sort=asc&apiKey={API_KEY}"
     try:
@@ -81,20 +78,34 @@ def get_high_of_day_metrics(ticker, date_str):
                 lod_bar = min(results, key=lambda x: x["l"])
                 timestamp_ms = hod_bar["t"]
                 
-                # Convert the Unix millisecond timestamp directly to New York Time
+                # Convert Unix millisecond timestamp directly to New York Time
                 utc_dt = datetime.utcfromtimestamp(timestamp_ms / 1000.0)
                 est_offset = timedelta(hours=-4) 
                 est_dt = utc_dt + est_offset
+                
+                # Calculate duration relative to the 09:30 AM Open session anchor
+                market_open = est_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+                market_close = est_dt.replace(hour=16, minute=0, second=0, microsecond=0)
+                
+                if est_dt < market_open:
+                    duration_str = "Premarket"
+                elif est_dt > market_close:
+                    duration_str = "Post-Hours"
+                else:
+                    diff = est_dt - market_open
+                    mins_elapsed = int(diff.total_seconds() // 60)
+                    duration_str = f"{mins_elapsed}m from Open"
                 
                 return {
                     "high": float(hod_bar["h"]),
                     "low": float(lod_bar["l"]),
                     "time": est_dt.strftime("%I:%M %p"),
+                    "duration": duration_str,
                     "peak_min_vol": int(hod_bar["v"])
                 }
     except Exception:
         pass
-    return {"high": 0.0, "low": 0.0, "time": "N/A", "peak_min_vol": 0}
+    return {"high": 0.0, "low": 0.0, "time": "N/A", "duration": "—", "peak_min_vol": 0}
 
 # ==============================================================================
 # DATABASE PERSISTENCE LAYER
@@ -134,7 +145,6 @@ def main():
                 cache_updated = True
                 time.sleep(12)  # Strict Free-Tier Pacing Buffer
     
-    # Evict sessions outside the rolling lookback window to save disk space
     active_sessions = {d: cache["market_sessions"][d] for d in target_dates if d in cache["market_sessions"]}
     cache["market_sessions"] = active_sessions
     
@@ -183,10 +193,10 @@ def main():
                     if is_qualifier:
                         universe.add(ticker)
 
-    print(f"\nFiltered universe contains {len(universe)} tickers. Mapping range metrics...")
+    print(f"\nFiltered universe contains {len(universe)} tickers. Mapping composite matrix parameters...")
     metadata_updated = False
 
-    # Step 3: Fetch Float and 1-Minute Range Data (Deep Dive)
+    # Step 3: Fetch Float and Multi-Resolution Range Data
     filtered_universe = []
     for idx, ticker in enumerate(sorted(universe)):
         if ticker not in cache["ticker_metadata"]:
@@ -207,8 +217,9 @@ def main():
             cache["hod_matrix"][ticker] = {}
             
         for d in display_days:
-            if d not in cache["hod_matrix"][ticker] or "low" not in cache["hod_matrix"][ticker][d]:
-                print(f" -> Mapping 1-min High/Low/Time matrix for {ticker} on {d}...")
+            # Force re-query if the duration parameter is completely missing from legacy cache profiles
+            if d not in cache["hod_matrix"][ticker] or "duration" not in cache["hod_matrix"][ticker][d]:
+                print(f" -> Mapping 1-min metrics and duration scales for {ticker} on {d}...")
                 metrics = get_high_of_day_metrics(ticker, d)
                 cache["hod_matrix"][ticker][d] = metrics
                 metadata_updated = True
@@ -227,7 +238,7 @@ def main():
         
         for d in display_days:
             day_metrics = calculated_data.get(ticker, {}).get(d, {"gain": 0.0, "close": 0.0, "volume": 0, "qualified": False})
-            hod_metrics = cache["hod_matrix"].get(ticker, {}).get(d, {"high": 0.0, "low": 0.0, "time": "N/A", "peak_min_vol": 0})
+            hod_metrics = cache["hod_matrix"].get(ticker, {}).get(d, {"high": 0.0, "low": 0.0, "time": "N/A", "duration": "—", "peak_min_vol": 0})
             
             ticker_history.append({
                 "date": d,
@@ -238,7 +249,8 @@ def main():
                 "high": hod_metrics.get("high", 0.0),
                 "low": hod_metrics.get("low", 0.0),
                 "time": hod_metrics.get("time", "N/A"),
-                "peak_vol": hod_metrics.get("peak_min_vol", 0)
+                "duration": hod_metrics.get("duration", "—"),
+                "peak_min_vol": hod_metrics.get("peak_min_vol", 0)
             })
             if d == latest_day:
                 max_latest_gain = day_metrics["gain"]
@@ -263,7 +275,7 @@ def main():
         <title>Momentum Lifecycle Grid</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 20px; margin: 0; }}
-            .container {{ max-width: 1050px; margin: 0 auto; background: #1e293b; padding: 25px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); }}
+            .container {{ max-width: 1100px; margin: 0 auto; background: #1e293b; padding: 25px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); }}
             h2 {{ margin-top: 0; color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; }}
             p {{ color: #94a3b8; font-size: 13px; margin-bottom: 20px; }}
             table {{ width: 100%; border-collapse: collapse; text-align: left; }}
@@ -279,11 +291,12 @@ def main():
             .spark-neutral {{ color: #94a3b8; }}
             .detail-row {{ display: none; background-color: #111827; }}
             .detail-container {{ padding: 15px; border-left: 3px solid #38bdf8; }}
-            .sub-table {{ width: 100%; max-width: 950px; margin: 5px 0; border: none; }}
+            .sub-table {{ width: 100%; max-width: 1000px; margin: 5px 0; border: none; }}
             .sub-table th {{ background-color: #1f2937; color: #94a3b8; padding: 8px; font-size: 11px; text-align: left; }}
             .sub-table td {{ padding: 8px; font-size: 12px; color: #e2e8f0; border-bottom: 1px solid #374151; }}
             .timestamp {{ font-size: 11px; color: #64748b; text-align: right; margin-top: 25px; }}
             .vol-highlight {{ color: #38bdf8; font-weight: bold; }}
+            .duration-highlight {{ color: #22d3ee; font-weight: 500; }}
             .high-highlight {{ color: #f59e0b; font-weight: bold; }}
             .low-highlight {{ color: #c084fc; font-weight: bold; }}
         </style>
@@ -296,8 +309,8 @@ def main():
     </head>
     <body>
         <div class="container">
-            <h2>📈 Multi-Day Trajectory Grid (Omni-Range View)</h2>
-            <p>Click ticker rows to track daily ranges, breakdown trajectories, and structural execution price marks.</p>
+            <h2>📈 Multi-Day Trajectory Grid (Omni-Resolution View)</h2>
+            <p>Click rows to expand full multi-day bounce profiles. Tracks exact 1-minute range extremes alongside the duration window from market open.</p>
             <table>
                 <tr>
                     <th>Ticker</th>
@@ -328,7 +341,7 @@ def main():
         <tr id="{detail_id}" class="detail-row">
             <td colspan="{2 + len(display_days)}">
                 <div class="detail-container">
-                    <strong style="color:#38bdf8; font-size:12px;">📊 Detailed Daily Intraday Bounds: {row['ticker']}</strong>
+                    <strong style="color:#38bdf8; font-size:12px;">📊 High-Resolution Intraday Liquidity Bounds: {row['ticker']}</strong>
                     <table class="sub-table">
                         <tr>
                             <th>Date</th>
@@ -336,9 +349,10 @@ def main():
                             <th>Low Price</th>
                             <th>Close Price</th>
                             <th>Daily Move</th>
-                            <th>High Time</th>
+                            <th>High Time (1m)</th>
+                            <th>Duration to Peak</th>
                             <th>Daily Agg Vol</th>
-                            <th>Peak Min Vol (At HOD)</th>
+                            <th>Peak 1-Min Vol</th>
                         </tr>
         """
         for day in row["history"]:
@@ -348,8 +362,9 @@ def main():
             c_str = f"${day['close']:.2f}" if day['close'] > 0 else "—"
             g_str = f"+{day['gain']:.2f}%" if day['gain'] > 0 else f"{day['gain']:.2f}%"
             t_str = f"⏰ {day['time']}" if day['time'] != "N/A" else "—"
+            dur_str = day['duration']
             v_str = f"{day['volume']:,}" if day['volume'] else "0"
-            p_str = f"{day['peak_vol']:,}" if day['peak_vol'] > 0 else "—"
+            p1_str = f"{day['peak_min_vol']:,}" if day['peak_min_vol'] > 0 else "—"
             
             html += f"""
                         <tr>
@@ -359,8 +374,9 @@ def main():
                             <td>{c_str}</td>
                             <td style="color: {('#4ade80' if day['gain'] >= 0 else '#f87171')}; font-weight:500;">{g_str}</td>
                             <td style="color: #cbd5e1; font-weight: 500;">{t_str}</td>
+                            <td class="duration-highlight">{dur_str}</td>
                             <td>{v_str}</td>
-                            <td class="vol-highlight">{p_str}</td>
+                            <td class="vol-highlight">{p1_str}</td>
                         </tr>
             """
         html += """
@@ -382,6 +398,27 @@ def main():
     with open(os.path.join(WEB_DIR, "index.html"), "w") as f:
         f.write(html)
     print("Dashboard matrix completely updated and HTML rendered.")
+
+    # ==============================================================================
+    # AUTOMATED GIT PUSH BACKUP ENGINE
+    # ==============================================================================
+    import subprocess
+    try:
+        repo_dir = os.path.expanduser("~/tracker")
+        subprocess.run(["git", "add", "history.json"], cwd=repo_dir, check=True)
+        status_check = subprocess.run(["git", "status", "--porcelain", "history.json"], cwd=repo_dir, capture_output=True, text=True)
+        
+        if status_check.stdout.strip():
+            print(" -> Detected updates in history.json. Committing changes...")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            subprocess.run(["git", "commit", "-m", f"Automated 1-min duration snapshot: {timestamp}"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, check=True)
+            print("Successfully backed up history.json to GitHub repo.")
+        else:
+            print(" -> No changes detected in history.json. Skipping backup push.")
+            
+    except Exception as git_error:
+        print(f" ! Git automated backup engine failed: {git_error}")
 
 if __name__ == "__main__":
     main()
