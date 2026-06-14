@@ -13,11 +13,15 @@ TARGET_GAIN = 0.50             # 50% minimum close-to-close gain to qualify
 MIN_LIQUIDITY_VOLUME = 100000  # Filter out zero-volume "sub-penny zombie" spikes
 MIN_PRICE_FLOOR = 1.00         # Filter out sub-dollar junk to control locate fees
 CACHE_FILE = os.path.expanduser("~/tracker/history.json")
+INTRADAY_DIR = os.path.expanduser("~/tracker/intraday")
 WEB_DIR = os.path.expanduser("~/tracker/www")
 
 if not API_KEY:
     print("ERROR: MASSIVE_API_KEY environment variable is missing.")
     sys.exit(1)
+
+# Ensure local directory structure is intact
+os.makedirs(INTRADAY_DIR, exist_ok=True)
 
 # ==============================================================================
 # CORE FILTERING & API ACCESS FUNCTIONS
@@ -63,10 +67,25 @@ def get_ticker_details(ticker):
         return response.json().get("results", {})
     return {}
 
+def save_intraday_json(ticker, date_str, parsed_minutes):
+    """Saves per-minute OHLCV data array to an isolated, stock-specific local file."""
+    file_path = os.path.join(INTRADAY_DIR, f"{ticker}_intraday.json")
+    data = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data[date_str] = parsed_minutes
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=2)
+
 def get_high_of_day_metrics(ticker, date_str):
     """
-    Parses 1-minute historical aggregate bars (4:00 AM to 8:00 PM EST) to isolate
-    absolute high/low execution marks and calculates the time duration from the open.
+    Parses 1-minute historical aggregate bars (4:00 AM to 8:00 PM EST).
+    Extracts high-level range markers for the main dashboard and archives
+    the full per-minute candlestick path locally.
     """
     url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{date_str}/{date_str}?adjusted=true&sort=asc&apiKey={API_KEY}"
     try:
@@ -76,14 +95,29 @@ def get_high_of_day_metrics(ticker, date_str):
             if results:
                 hod_bar = max(results, key=lambda x: x["h"])
                 lod_bar = min(results, key=lambda x: x["l"])
+                
+                # Format full minute-by-minute array for local archive storage
+                parsed_minutes = []
+                for bar in results:
+                    bar_utc = datetime.utcfromtimestamp(bar["t"] / 1000.0)
+                    bar_est = bar_utc + timedelta(hours=-4)
+                    parsed_minutes.append({
+                        "time": bar_est.strftime("%I:%M %p"),
+                        "open": float(bar["o"]),
+                        "high": float(bar["h"]),
+                        "low": float(bar["l"]),
+                        "close": float(bar["c"]),
+                        "volume": int(bar["v"])
+                    })
+                
+                # Write per-minute database files out asynchronously
+                save_intraday_json(ticker, date_str, parsed_minutes)
+                
+                # Process structural dashboard tracking targets
                 timestamp_ms = hod_bar["t"]
-                
-                # Convert Unix millisecond timestamp directly to New York Time
                 utc_dt = datetime.utcfromtimestamp(timestamp_ms / 1000.0)
-                est_offset = timedelta(hours=-4) 
-                est_dt = utc_dt + est_offset
+                est_dt = utc_dt + timedelta(hours=-4)
                 
-                # Calculate duration relative to the 09:30 AM Open session anchor
                 market_open = est_dt.replace(hour=9, minute=30, second=0, microsecond=0)
                 market_close = est_dt.replace(hour=16, minute=0, second=0, microsecond=0)
                 
@@ -217,9 +251,9 @@ def main():
             cache["hod_matrix"][ticker] = {}
             
         for d in display_days:
-            # Force re-query if the duration parameter is completely missing from legacy cache profiles
+            # Force re-query if checking from a raw cache start to generate internal pricing files
             if d not in cache["hod_matrix"][ticker] or "duration" not in cache["hod_matrix"][ticker][d]:
-                print(f" -> Mapping 1-min metrics and duration scales for {ticker} on {d}...")
+                print(f" -> Mapping 1-min metrics and compiling intraday archive for {ticker} on {d}...")
                 metrics = get_high_of_day_metrics(ticker, d)
                 cache["hod_matrix"][ticker][d] = metrics
                 metadata_updated = True
@@ -310,7 +344,7 @@ def main():
     <body>
         <div class="container">
             <h2>📈 Multi-Day Trajectory Grid (Omni-Resolution View)</h2>
-            <p>Click rows to expand full multi-day bounce profiles. Tracks exact 1-minute range extremes alongside the duration window from market open.</p>
+            <p>Click rows to expand full multi-day bounce profiles. Intraday minute-by-minute granular price layers are archived straight to your local server array folder.</p>
             <table>
                 <tr>
                     <th>Ticker</th>
@@ -405,17 +439,21 @@ def main():
     import subprocess
     try:
         repo_dir = os.path.expanduser("~/tracker")
-        subprocess.run(["git", "add", "history.json"], cwd=repo_dir, check=True)
-        status_check = subprocess.run(["git", "status", "--porcelain", "history.json"], cwd=repo_dir, capture_output=True, text=True)
+        
+        # Track BOTH the root high-level JSON and the entire folder of granular files
+        subprocess.run(["git", "add", "history.json", "intraday/"], cwd=repo_dir, check=True)
+        
+        # Check if anything changed to avoid empty commit errors
+        status_check = subprocess.run(["git", "status", "--porcelain"], cwd=repo_dir, capture_output=True, text=True)
         
         if status_check.stdout.strip():
-            print(" -> Detected updates in history.json. Committing changes...")
+            print(" -> Detected updates in dataset matrix files. Committing changes...")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            subprocess.run(["git", "commit", "-m", f"Automated 1-min duration snapshot: {timestamp}"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "commit", "-m", f"Automated dataset sync: {timestamp}"], cwd=repo_dir, check=True)
             subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, check=True)
-            print("Successfully backed up history.json to GitHub repo.")
+            print("Successfully backed up full data structures to GitHub repo.")
         else:
-            print(" -> No changes detected in history.json. Skipping backup push.")
+            print(" -> No changes detected in any data frames. Skipping backup push.")
             
     except Exception as git_error:
         print(f" ! Git automated backup engine failed: {git_error}")
